@@ -1,4 +1,3 @@
-```py
 import tkinter as tk
 from tkinter import ttk
 import sounddevice as sd
@@ -563,4 +562,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = EnvelopeSimulator(root)
     root.mainloop()
-```
+
