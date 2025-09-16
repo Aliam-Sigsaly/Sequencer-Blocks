@@ -206,6 +206,7 @@ class EnvelopeSequencer:
             self.note_canvas.create_text((x1 + x2) / 2, height / 2,
                                         text=f"{note_ms:.1f}ms")
 
+    # Add this method to improve audio stream configuration
     def start_audio_playback(self):
         """Start audio playback in a separate thread"""
         if self.is_audio_playing:
@@ -214,10 +215,20 @@ class EnvelopeSequencer:
         self.is_audio_playing = True
         self.stop_audio = False
 
-        # Start audio in a separate thread to avoid blocking the GUI
-        self.audio_thread = threading.Thread(target=self.audio_playback_loop)
-        self.audio_thread.daemon = True
-        self.audio_thread.start()
+        try:
+            # Use a larger buffer size to prevent underflows
+            self.audio_stream = sd.OutputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype='float32',
+                callback=self.audio_callback,
+                blocksize=1024,  # Increased buffer size
+                latency='high'   # Higher latency for stability
+            )
+            self.audio_stream.start()
+        except Exception as e:
+            print(f"Audio stream error: {e}")
+            self.is_audio_playing = False
 
     def stop_audio_playback(self):
         """Stop audio playback"""
@@ -249,47 +260,53 @@ class EnvelopeSequencer:
         finally:
             self.is_audio_playing = False
 
+    # Replace the audio_callback method with this optimized version
     def audio_callback(self, outdata, frames, time_info, status):
-        """Audio callback function that generates sound in real-time"""
         if status:
             print(f"Audio status: {status}")
 
-        # Generate audio data for the requested number of frames
+        if not self.is_playing:
+            outdata.fill(0)
+            return
+
+        # Generate audio data in bulk for better performance
         data = np.zeros(frames, dtype=np.float32)
 
-        for i in range(frames):
-            if not self.is_playing:
-                break
+        # Calculate all time values at once
+        elapsed_in_note = self.counter_value - self.note_start_sample
+        current_note_duration = self.note_durations[self.current_note]
 
-            # Calculate the current time in the note
-            elapsed_in_note = self.counter_value - self.note_start_sample
-            current_note_duration = self.note_durations[self.current_note]
-            normalized_value = elapsed_in_note / current_note_duration if current_note_duration > 0 else 0
+        # Pre-calculate time values
+        time_in_seconds = (self.sample_count + np.arange(frames)) / self.sample_rate
+
+        # Process the entire frame at once
+        for i in range(frames):
+            if elapsed_in_note >= current_note_duration:
+                # Move to next note
+                self.note_start_sample = self.counter_value
+                self.current_note = (self.current_note + 1) % len(self.note_durations)
+                elapsed_in_note = 0
+                current_note_duration = self.note_durations[self.current_note]
+
+                # Update GUI in main thread
+                self.root.after(0, self.update_display)
 
             # Calculate envelope
+            normalized_value = elapsed_in_note / current_note_duration if current_note_duration > 0 else 0
             t_percent = normalized_value * 100
             A = self.attack_val.get()
             D = max(self.decay_val.get(), A)
             amp = self.compute_amplitude(t_percent, A, D)
 
-            # Generate sine wave with current frequency and envelope
+            # Generate sample
             frequency = self.freq_var.get()
-            time_in_seconds = self.sample_count / self.sample_rate
-            data[i] = amp * math.sin(2 * math.pi * frequency * time_in_seconds)
+            data[i] = amp * math.sin(2 * math.pi * frequency * time_in_seconds[i])
 
             # Increment counters
             self.counter_value += 1
             self.sample_count += 1
+            elapsed_in_note += 1
 
-            # Check if we've reached the end of the current note
-            if elapsed_in_note >= current_note_duration:
-                # Move to next note
-                self.note_start_sample = self.counter_value
-                self.current_note = (self.current_note + 1) % len(self.note_durations)
-                # Update GUI
-                self.root.after(0, self.update_display)
-
-        # Ensure the data is in the correct format
         outdata[:] = data.reshape(-1, 1)
 
     def update_note_durations(self, event=None):
@@ -339,20 +356,18 @@ class EnvelopeSequencer:
             actual_rate = self.sample_count / elapsed
             self.rate_var.set(f"{actual_rate:.0f} Hz")
 
+    # Replace the counter_loop method with this more efficient version
     def counter_loop(self):
-        sample_interval = 1.0 / self.sample_rate
-        last_update_time = time.time()
         update_interval = 0.05  # Update GUI every 50ms
-        next_time = time.perf_counter()
         samples_per_update = int(self.sample_rate * update_interval)
-
-        # Pre-allocate arrays for efficiency
-        normalized_chunk = np.zeros(samples_per_update)
+        next_time = time.perf_counter()
 
         while not self.stop_counter:
-            # Process a chunk of samples for efficiency
-            for i in range(samples_per_update):
-                # Increment counter
+            # Process a chunk of samples
+            for _ in range(samples_per_update):
+                if self.stop_counter:
+                    break
+
                 self.counter_value += 1
                 self.sample_count += 1
 
@@ -364,33 +379,13 @@ class EnvelopeSequencer:
                     # Move to next note
                     self.note_start_sample = self.counter_value
                     self.current_note = (self.current_note + 1) % len(self.note_durations)
-                    elapsed_in_note = 0
-                    current_note_duration = self.note_durations[self.current_note]
 
                     # Clear previous step recording shape when new note is triggered
                     if self.recording:
                         self.actual_shape = []
 
-                # Calculate normalized value
-                normalized_value = elapsed_in_note / current_note_duration
-                normalized_chunk[i] = normalized_value
-
-                # Record shape if recording
-                if self.recording:
-                    t_percent = normalized_value * 100
-                    A = self.attack_val.get()
-                    D = max(self.decay_val.get(), A)
-                    amp = self.compute_amplitude(t_percent, A, D)
-                    self.actual_shape.append((t_percent, amp))
-
-            # Add the chunk to the buffer
-            self.normalized_buffer.extend(normalized_chunk)
-
             # Update GUI
-            current_time = time.time()
-            if current_time - last_update_time >= update_interval:
-                self.root.after(0, self.update_display)
-                last_update_time = current_time
+            self.root.after(0, self.update_display)
 
             # High-precision timing
             next_time += update_interval
